@@ -1,22 +1,23 @@
-app = "notrix-app"
-primary_region = "iad"
+# fly.toml app configuration file generated for app-falling-pond-6463 on 2026-02-03T22:13:59Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'app-falling-pond-6463'
+primary_region = 'iad'
 
 [build]
-  dockerfile = "Dockerfile"
-
-[env]
-  PORT = "8080"
-  DATABASE_URL = "sqlite+aiosqlite:////data/notrix.db"
-  TARGET_PORTFOLIO_PATH = "/app/data/target_portfolio.csv"
-
-[[mounts]]
-  source = "notrix_data"
-  destination = "/data"
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"
+  auto_stop_machines = 'stop'
   auto_start_machines = true
   min_machines_running = 0
-  processes = ["app"]
+  processes = ['app']
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 256
