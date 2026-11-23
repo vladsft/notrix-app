@@ -1,6 +1,8 @@
 {% extends "base.html" %}
 
-{% block title %}Dashboard - Notrix{% endblock %}
+{% block title %}Dashboard - Placing Jade{% endblock %}
+
+{% from "partials/dial.html" import dial %}
 
 {% block content %}
 <div class="page-header">
@@ -26,17 +28,47 @@
 {% if connected and account %}
 <div class="card">
     <div class="card-header">
-        <h2>Account Summary</h2>
-        <form method="post" action="/dashboard/refresh" style="margin: 0;">
-            <button type="submit" class="btn btn-secondary btn-small">Refresh</button>
-        </form>
+        <h2>Overview</h2>
+        <span class="overview-total">${{ "{:,.0f}".format(account.portfolio_value) }} across {{ positions|length }} holding{{ "" if positions|length == 1 else "s" }}</span>
     </div>
-    
+
+    <div class="dial-grid">
+        {% if risk and not risk.error %}
+        {{ dial(risk.risk_used, "Risk budget used", "of a %g%% one-day loss limit" % risk.risk_budget_pct,
+                "var(--color-danger)" if risk.risk_used > 100 else "var(--color-accent)") }}
+        {% else %}
+        {{ dial(none, "Risk budget used", "Run the risk check to fill this in") }}
+        {% endif %}
+
+        {{ dial(overview.alignment, "In line with strategy",
+                "Share of the portfolio already at its target" if overview.alignment is not none else "No valid strategy file") }}
+
+        {% if risk and not risk.error and risk.outlook %}
+        {{ dial(risk.outlook.prob_profit, "Chance of profit by " ~ risk.outlook.expiry,
+                "Implied by option prices" ~ (", covering %.0f%% of holdings" % risk.outlook.coverage if risk.outlook.coverage < 99.5 else "")) }}
+        {% elif risk and not risk.error %}
+        {{ dial(none, "Chance of profit", "Not enough option quotes for these holdings") }}
+        {% else %}
+        {{ dial(none, "Chance of profit", "Run the risk check to fill this in") }}
+        {% endif %}
+    </div>
+
+    {% if overview.allocation %}
+    {% set shades = ["#8fd3ff", "#6fb4e6", "#5092c6", "#3a73a3", "#2b577f", "#22436a"] %}
+    <div class="alloc-title">Where the money is</div>
+    <div class="alloc-strip">
+        {% for part in overview.allocation %}
+        <span style="flex: {{ "%.2f" % part.weight }}; background-color: {{ "var(--color-border)" if part.label == "Cash" else shades[loop.index0] }};"></span>
+        {% endfor %}
+    </div>
+    <div class="alloc-legend">
+        {% for part in overview.allocation %}
+        <span><i style="background-color: {{ "var(--color-border)" if part.label == "Cash" else shades[loop.index0] }};"></i>{{ part.label }} {{ "%.0f" % part.weight }}%</span>
+        {% endfor %}
+    </div>
+    {% endif %}
+
     <div class="account-summary">
-        <div class="summary-item">
-            <span class="summary-label">Portfolio Value</span>
-            <span class="summary-value">${{ "{:,.2f}".format(account.portfolio_value) }}</span>
-        </div>
         <div class="summary-item">
             <span class="summary-label">Equity</span>
             <span class="summary-value">${{ "{:,.2f}".format(account.equity) }}</span>
@@ -50,10 +82,19 @@
             <span class="summary-value">${{ "{:,.2f}".format(account.buying_power) }}</span>
         </div>
     </div>
-    
-    {% if fetched_at %}
-    <p class="last-refresh">Last refresh: {{ fetched_at.strftime('%Y-%m-%d %H:%M:%S UTC') }}</p>
-    {% endif %}
+
+    <div class="form-actions">
+        <form method="post" action="/dashboard/refresh" style="margin: 0;">
+            <button type="submit" class="btn btn-secondary btn-small">Refresh</button>
+        </form>
+        {% if positions %}
+        <a href="/dashboard?simulate=1" class="btn btn-primary btn-small">{% if risk %}Run risk check again{% else %}Run risk check{% endif %}</a>
+        <span class="text-muted">The risk check takes up to a minute and is kept for 30 minutes.</span>
+        {% endif %}
+        {% if fetched_at %}
+        <span class="last-refresh" style="margin: 0 0 0 auto;">Last refresh: {{ fetched_at.strftime('%Y-%m-%d %H:%M:%S UTC') }}</span>
+        {% endif %}
+    </div>
 </div>
 
 <div class="card">
@@ -97,6 +138,82 @@
     <p class="empty-state">No positions in your account.</p>
     {% endif %}
 </div>
+
+{% if positions %}
+<div class="card" id="risk">
+    <div class="card-header">
+        <h2>Portfolio Risk Simulation</h2>
+    </div>
+
+    {% if not risk %}
+    <p class="text-muted">Run the risk check above to simulate 10,000 one-day scenarios for these positions, using how the stocks have moved and moved together since 2022.</p>
+    {% elif risk.error %}
+    <div class="alert alert-error">
+        {{ risk.error }}
+        {% for line in risk.diagnostics %}<p class="text-muted">{{ line }}</p>{% endfor %}
+    </div>
+    {% else %}
+    <div class="chart-container">{{ risk.pnl_chart | safe }}</div>
+    <p class="text-muted">Distribution of one-day profit and loss across 10,000 simulated scenarios, based on {{ risk.num_trading_days }} trading days of history.</p>
+
+    <div class="metric-grid">
+        <div class="metric-card">
+            <div class="metric-label">Portfolio value</div>
+            <div class="metric-value">${{ "{:,.0f}".format(risk.total_investment) }}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Daily volatility</div>
+            <div class="metric-value">${{ "{:,.0f}".format(risk.port_daily_vol) }}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">VaR 99.5% (1 day in 200)</div>
+            <div class="metric-value">${{ "{:,.0f}".format(risk.var_995) }}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">TVaR 99.5%</div>
+            <div class="metric-value">${{ "{:,.0f}".format(risk.tvar_995) }}</div>
+            <div class="metric-source">Average loss on the days worse than the VaR.</div>
+        </div>
+    </div>
+
+    <h3>Largest contributors to risk</h3>
+    <div class="chart-container">{{ risk.contribution_chart | safe }}</div>
+    <div class="table-container">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Ticker</th>
+                    <th class="text-right">Position</th>
+                    <th class="text-right">Weight</th>
+                    <th class="text-right">Volatility share</th>
+                    <th class="text-right">VaR 99.5%</th>
+                    <th class="text-right">VaR share</th>
+                    <th class="text-right">TVaR 99.5%</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in risk.risk_contributions %}
+                <tr>
+                    <td class="symbol">{{ row.ticker }}</td>
+                    <td class="text-right">${{ "{:,.0f}".format(row.position_value) }}</td>
+                    <td class="text-right">{{ "{:.1f}".format(row.weight * 100) }}%</td>
+                    <td class="text-right">{{ "{:.1f}".format(row.component_vol_pct * 100) }}%</td>
+                    <td class="text-right">${{ "{:,.0f}".format(row.component_var_995) }}</td>
+                    <td class="text-right">{{ "{:.1f}".format(row.component_var_995_pct * 100) }}%</td>
+                    <td class="text-right">${{ "{:,.0f}".format(row.component_tvar_995) }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    <p class="text-muted">Each position's share of total risk. Shares add up to the headline figure, so the largest rows are the biggest drivers of your downside.</p>
+
+    {% if risk.skipped_tickers %}
+    <div class="alert">No price data for {{ risk.skipped_tickers | join(', ') }}. Left out of the simulation.</div>
+    {% endif %}
+    {% endif %}
+</div>
+{% endif %}
 {% elif not error %}
 <div class="card">
     <p class="empty-state">

@@ -21,7 +21,7 @@ Notrix does NOT:
 Notrix now includes a Financial Command Center with dedicated tabs for:
 - Live Market Ticker
 - Stock Research & Analysis (charts, indicators, predictions, news & sentiment)
-- Portfolio Calculator (Daily Profitability Calculator)
+- Portfolio Calculator (options-implied distribution of portfolio value, VaR and chance of profit)
 - Economic News
 - Insurance News
 - Insurance Industry Tracker
@@ -227,6 +227,7 @@ All configuration is done through environment variables (set in `.env`):
 | `DATABASE_URL` | SQLite database path | `sqlite+aiosqlite:///./notrix.db` |
 | `TARGET_PORTFOLIO_PATH` | Path to portfolio CSV | `data/target_portfolio.csv` |
 | `WEIGHT_SUM_EPSILON` | Weight sum tolerance | `0.01` |
+| `RISK_BUDGET_PCT` | One-day loss limit behind the dashboard's risk dial, as a percentage of portfolio value | `5` |
 
 ## Security
 

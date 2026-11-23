@@ -9,11 +9,9 @@ import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
-from scipy import interpolate
-from scipy.interpolate import BSpline, splrep
-from scipy.optimize import brentq
-from scipy.stats import gaussian_kde, norm
 from textblob import TextBlob
+
+from app.financial_command_center.options_risk import implied_cdf, simulate
 
 warnings.filterwarnings("ignore")
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
@@ -881,225 +879,127 @@ def predict_stock_movement(hist: pd.DataFrame):
     return prediction, normalized_score, signals
 
 
-def filter_liquid_options(
-    options_dataframe: pd.DataFrame, min_volume: int, max_spread_ratio: float
-) -> pd.DataFrame:
-    return options_dataframe[
-        (options_dataframe["volume"] >= min_volume)
-        & (options_dataframe["bid"] > 0)
-        & ((options_dataframe["ask"] - options_dataframe["bid"]) / options_dataframe["ask"] <= max_spread_ratio)
-    ]
+NEW_YORK = "America/New_York"
 
 
-def call_bs_price(
-    spot_price: float,
-    strike_price: float,
-    time_to_expiry: float,
-    risk_free_rate: float,
-    volatility: float,
-) -> float:
-    if time_to_expiry <= 0:
-        return max(spot_price - strike_price, 0)
-    d1 = (
-        np.log(spot_price / strike_price)
-        + (risk_free_rate + 0.5 * volatility**2) * time_to_expiry
-    ) / (volatility * np.sqrt(time_to_expiry))
-    d2 = d1 - volatility * np.sqrt(time_to_expiry)
-    return spot_price * norm.cdf(d1) - strike_price * np.exp(-risk_free_rate * time_to_expiry) * norm.cdf(d2)
+def common_expirations(tickers: List[str]) -> Tuple[List[str], List[str]]:
+    """Future option expiry dates that every ticker trades, soonest first.
+
+    Returns (dates, tickers with no listed options). Those tickers are ignored when intersecting.
+    """
+    expirations, no_options = [], []
+    for ticker_symbol in tickers:
+        try:
+            dates = set(yf.Ticker(ticker_symbol).options)
+        except Exception:
+            dates = set()
+        if dates:
+            expirations.append(dates)
+        else:
+            no_options.append(ticker_symbol)
+    if not expirations:
+        return [], no_options
+    today = pd.Timestamp.now(tz=NEW_YORK).strftime("%Y-%m-%d")
+    return sorted(date for date in set.intersection(*expirations) if date > today), no_options
 
 
-def implied_vol_call(
-    price: float, spot_price: float, strike_price: float, time_to_expiry: float, risk_free_rate: float
-) -> float:
-    if time_to_expiry <= 0:
-        return np.nan
-
-    def objective(volatility):
-        return call_bs_price(spot_price, strike_price, time_to_expiry, risk_free_rate, volatility) - price
-
-    try:
-        return brentq(objective, 1e-9, 5.0)
-    except ValueError:
-        return np.nan
+def return_correlation(tickers: List[str]) -> np.ndarray:
+    """Correlation of daily returns over the past year, in the order given."""
+    if len(tickers) == 1:
+        return np.ones((1, 1))
+    closes = yf.download(list(tickers), period="1y", progress=False, auto_adjust=True)["Close"]
+    correlation = closes.pct_change().corr().reindex(index=tickers, columns=tickers).fillna(0).to_numpy(copy=True)
+    np.fill_diagonal(correlation, 1)
+    return correlation
 
 
-def build_pdf(
-    strike_grid: np.ndarray,
-    iv_spline_tck,
-    spot_price: float,
-    time_to_expiry: float,
-    risk_free_rate: float,
-) -> Tuple[np.ndarray, np.ndarray]:
-    implied_vols = BSpline(*iv_spline_tck)(strike_grid)
-    call_prices = np.array(
-        [
-            call_bs_price(spot_price, strike, time_to_expiry, risk_free_rate, volatility)
-            for strike, volatility in zip(strike_grid, implied_vols)
-        ]
-    )
-    first_derivative = np.gradient(call_prices, strike_grid)
-    second_derivative = np.gradient(first_derivative, strike_grid)
-    pdf_raw = np.exp(risk_free_rate * time_to_expiry) * second_derivative
-    pdf_raw = np.clip(pdf_raw, 0, None)
-    return strike_grid, pdf_raw
-
-
-def smooth_pdf(strike_grid: np.ndarray, pdf_raw: np.ndarray) -> np.ndarray:
-    kernel_density = gaussian_kde(strike_grid, weights=pdf_raw)
-    pdf_smoothed = kernel_density(strike_grid)
-    area = np.trapz(pdf_smoothed, strike_grid)
-    if area > 0:
-        pdf_smoothed /= area
-    return pdf_smoothed
-
-
-def intersection_of_lists(lists: List[List[str]]) -> List[str]:
-    """Returns the intersection of multiple lists."""
-    if not lists:
-        return []
-    intersection_set = set(lists[0])
-    for values in lists[1:]:
-        intersection_set &= set(values)
-    return list(intersection_set)
-
-
-def convolve_pdfs(x_lists: List[np.ndarray], pdf_lists: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
-    x_result = np.array(x_lists[0])
-    pdf_result = np.array(pdf_lists[0])
-
-    for list_index in range(1, len(x_lists)):
-        x_values = np.array(x_lists[list_index])
-        pdf_values = np.array(pdf_lists[list_index])
-        dx_result = np.mean(np.diff(x_result))
-        dx_values = np.mean(np.diff(x_values))
-        dx_step = min(dx_result, dx_values)
-        x_result_uniform = np.arange(x_result.min(), x_result.max(), dx_step)
-        x_values_uniform = np.arange(x_values.min(), x_values.max(), dx_step)
-        interpolated_result = interpolate.interp1d(
-            x_result, pdf_result, bounds_error=False, fill_value=0
-        )
-        interpolated_values = interpolate.interp1d(
-            x_values, pdf_values, bounds_error=False, fill_value=0
-        )
-        pdf_result_uniform = interpolated_result(x_result_uniform)
-        pdf_values_uniform = interpolated_values(x_values_uniform)
-        pdf_convolved = np.convolve(pdf_result_uniform, pdf_values_uniform) * dx_step
-        x_min_new = x_result_uniform.min() + x_values_uniform.min()
-        x_result = x_min_new + np.arange(len(pdf_convolved)) * dx_step
-        pdf_result = pdf_convolved
-
-    pdf_result = pdf_result / np.trapz(pdf_result, x_result)
-    return x_result, pdf_result
-
-
-def calculate_percentile(
-    x_values: np.ndarray, pdf_values: np.ndarray, percentile: float
-) -> float:
-    dx_values = np.diff(x_values)
-    pdf_midpoints = (pdf_values[:-1] + pdf_values[1:]) / 2
-    cdf = np.concatenate([[0], np.cumsum(pdf_midpoints * dx_values)])
-    cdf = cdf / cdf[-1]
-    target = percentile / 100.0
-    index = np.searchsorted(cdf, target)
-    if index == 0:
-        return x_values[0]
-    if index >= len(x_values):
-        return x_values[-1]
-    x_lower, x_upper = x_values[index - 1], x_values[index]
-    cdf_lower, cdf_upper = cdf[index - 1], cdf[index]
-    if cdf_upper == cdf_lower:
-        return x_lower
-    return x_lower + (x_upper - x_lower) * (target - cdf_lower) / (cdf_upper - cdf_lower)
-
-
-def calculate_probability_below(
-    x_values: np.ndarray, pdf_values: np.ndarray, threshold: float
-) -> float:
-    mask = x_values <= threshold
-    if not np.any(mask):
-        return 0.0
-    x_below = x_values[mask]
-    pdf_below = pdf_values[mask]
-    return np.trapz(pdf_below, x_below)
-
-
-def ticker_prediction(
-    ticker_index: int,
-    stock_list: pd.DataFrame,
-    possible_expirations: List[str],
-    expiration_index: int,
+def options_implied_values(
+    portfolio: pd.DataFrame,
+    expiry: str,
     risk_free_rate: float,
     min_volume: int,
     max_spread_ratio: float,
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    import io
-    import sys
+) -> Dict[str, object]:
+    """Simulate what the positions are worth on the expiry date, as implied by option prices.
 
-    investment_value = stock_list["Value"].iloc[ticker_index]
-    ticker_symbol = stock_list["Stocks"].iloc[ticker_index]
+    Returns the simulated values ("positions", None if nothing could be modelled), the
+    rows that were modelled ("included") and why each other ticker was left out ("skipped").
+    """
+    years = (pd.Timestamp(f"{expiry} 16:00", tz=NEW_YORK) - pd.Timestamp.now(tz=NEW_YORK)).total_seconds() / (365 * 86400)
+    marginals, kept, skipped = [], [], {}
+    for ticker_symbol in portfolio["Stocks"]:
+        try:
+            chain = yf.Ticker(ticker_symbol).option_chain(expiry)
+            marginal = implied_cdf(chain.calls, chain.puts, years, risk_free_rate, min_volume, max_spread_ratio)
+        except Exception as error:
+            skipped[ticker_symbol] = f"data error: {str(error)[:80]}"
+            continue
+        if marginal is None:
+            skipped[ticker_symbol] = "too few liquid option quotes"
+        else:
+            marginals.append(marginal)
+            kept.append(ticker_symbol)
+    # Positions that could not be modelled leave every figure, including today's value.
+    included = portfolio[portfolio["Stocks"].isin(kept)]
+    positions = simulate(marginals, included["Value"], return_correlation(kept)) if kept else None
+    return {"expiry": expiry, "included": included, "skipped": skipped, "positions": positions}
 
-    time.sleep(0.5)
 
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
-    sys.stdout = io.StringIO()
-    sys.stderr = io.StringIO()
+def summarise_distribution(
+    result: Dict[str, object], free_capital: float, var_confidence: int, percentiles: List[int]
+) -> Dict[str, object]:
+    """Headline figures for the simulated values from options_implied_values."""
+    included = result["included"]
+    values = result["positions"] + free_capital
+    today = float(included["Value"].sum() + free_capital)
+    capital = float(included["Unleveraged Value"].sum() + free_capital)
+    var_value = float(np.percentile(values, 100 - var_confidence))
+    levels = sorted(percentiles)
+    return {
+        "values": values,
+        "today": today,
+        "capital": capital,
+        "leverage": today / capital,
+        "var_value": var_value,
+        "var_loss": today - var_value,
+        "mean": float(values.mean()),
+        "prob_profit": float((values > today).mean()),
+        "percentiles": [
+            {
+                "percentile": level,
+                "value": float(value),
+                "return_on_capital": float((value - today) / capital * 100),
+                "return_on_position": float((value / today - 1) * 100),
+            }
+            for level, value in zip(levels, np.percentile(values, levels) if levels else [])
+        ],
+    }
 
-    try:
-        ticker_data = yf.Ticker(ticker_symbol)
-        current_price = ticker_data.history(period="1d")["Close"].iloc[-1]
-        number_of_shares = investment_value / current_price
 
-        selected_expiry = possible_expirations[expiration_index]
-        option_chain = ticker_data.option_chain(selected_expiry)
-        calls_dataframe = option_chain.calls[
-            ["strike", "lastPrice", "bid", "ask", "volume"]
-        ].copy()
+def options_outlook(holdings: Dict[str, float], cash: float) -> Optional[Dict[str, object]]:
+    """Chance the holdings are worth more on the first option expiry at least two weeks away.
 
-        filtered_calls = filter_liquid_options(
-            calls_dataframe, min_volume=min_volume, max_spread_ratio=max_spread_ratio
-        )
-
-        time_to_expiry = (
-            pd.to_datetime(selected_expiry) - pd.Timestamp.today()
-        ).days / 365.0
-        spot_price = ticker_data.history().iloc[-1]["Close"]
-
-        filtered_calls["iv"] = filtered_calls.apply(
-            lambda row: implied_vol_call(
-                row["lastPrice"], spot_price, row["strike"], time_to_expiry, risk_free_rate
-            ),
-            axis=1,
-        )
-
-        filtered_calls.dropna(subset=["iv"], inplace=True)
-
-        if len(filtered_calls) < 4:
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
-            return None, None
-
-        strikes = filtered_calls["strike"].values
-        implied_vols = filtered_calls["iv"].values
-
-        iv_spline = splrep(strikes, implied_vols, s=10, k=3)
-        strike_grid = np.linspace(strikes.min(), strikes.max(), 300)
-
-        strike_grid_for_pdf, pdf_raw = build_pdf(
-            strike_grid, iv_spline, spot_price, time_to_expiry, risk_free_rate
-        )
-        pdf_smoothed = smooth_pdf(strike_grid_for_pdf, pdf_raw)
-        investment_grid = np.array([strike * number_of_shares for strike in strike_grid_for_pdf])
-        pdf_smoothed_over_investment = pdf_smoothed / number_of_shares
-
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
-        return investment_grid, pdf_smoothed_over_investment
-
-    except Exception:
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
-        raise
+    `holdings` maps ticker to position value. Returns None when no holding has usable option quotes.
+    """
+    held = {ticker: value for ticker, value in holdings.items() if value > 0}
+    expirations, no_options = common_expirations(list(held))
+    portfolio = pd.DataFrame(
+        [(ticker, value, value) for ticker, value in held.items() if ticker not in no_options],
+        columns=["Stocks", "Value", "Unleveraged Value"],
+    )
+    if not expirations or portfolio.empty:
+        return None
+    cutoff = (pd.Timestamp.now(tz=NEW_YORK) + pd.Timedelta(days=14)).strftime("%Y-%m-%d")
+    expiry = next((date for date in expirations if date >= cutoff), expirations[-1])
+    result = options_implied_values(portfolio, expiry, risk_free_rate=0.04, min_volume=20, max_spread_ratio=0.2)
+    if result["positions"] is None:
+        return None
+    stats = summarise_distribution(result, max(cash, 0.0), var_confidence=95, percentiles=[])
+    return {
+        "prob_profit": stats["prob_profit"] * 100,
+        "expiry": expiry,
+        "coverage": float(result["included"]["Value"].sum() / sum(held.values()) * 100),
+    }
 
 
 def get_insurance_company_data() -> Dict[str, List[Dict[str, object]]]:
@@ -1227,6 +1127,276 @@ def get_insurance_company_data() -> Dict[str, List[Dict[str, object]]]:
             sys.stderr = old_stderr
 
     return results
+
+
+def simulate_portfolio_pnl(
+    tickers: List[str],
+    quantities: List[float],
+    start_date: str = "2022-01-01",
+    num_simulations: int = 10_000,
+) -> Optional[Dict[str, object]]:
+    """
+    Run a one-day Monte Carlo simulation on a portfolio using
+    Cholesky-correlated GBM draws on the log-return covariance matrix.
+
+    Returns a dict with simulation results — VaR/TVaR figures, the full
+    P&L distribution, and a per-asset `risk_contributions` table that
+    decomposes both daily volatility (Euler decomposition on the
+    covariance matrix) and VaR/TVaR (conditional expectation on the
+    simulated scenarios) into contributions from each position.
+
+    Returns a dict with just an 'error' key explaining what went wrong
+    if the simulation cannot be run.
+    """
+    if not tickers or not quantities:
+        return {"error": "No tickers or quantities provided."}
+
+    diagnostics = []
+
+    # ── Step 1: Download price data ──
+    # Try bulk download first, then fall back to individual downloads
+    price_series = {}
+
+    try:
+        raw = yf.download(tickers, start=start_date, progress=False)
+        if raw is not None and not raw.empty:
+            if isinstance(raw.columns, pd.MultiIndex):
+                close_df = raw["Close"]
+            else:
+                close_df = raw[["Close"]]
+                close_df.columns = tickers
+
+            if isinstance(close_df, pd.Series):
+                close_df = close_df.to_frame(name=tickers[0])
+
+            for t in tickers:
+                if t in close_df.columns:
+                    col = close_df[t].dropna()
+                    if len(col) >= 10:
+                        price_series[t] = col
+                    else:
+                        diagnostics.append(f"{t}: only {len(col)} price points from bulk download")
+                else:
+                    diagnostics.append(f"{t}: not found in bulk download")
+    except Exception as e:
+        diagnostics.append(f"Bulk download failed: {str(e)[:100]}")
+
+    # Individual fallback for any tickers we missed
+    missing = [t for t in tickers if t not in price_series]
+    for t in missing:
+        try:
+            single = yf.download(t, start=start_date, progress=False)
+            if single is not None and not single.empty:
+                single = normalize_dataframe(single)
+                col = safe_get_column(single, "Close")
+                if col is not None:
+                    col = col.dropna()
+                    if len(col) >= 10:
+                        price_series[t] = col
+                        diagnostics.append(f"{t}: recovered via individual download ({len(col)} days)")
+                    else:
+                        diagnostics.append(f"{t}: only {len(col)} price points even individually")
+                else:
+                    diagnostics.append(f"{t}: no Close column in individual download")
+            else:
+                diagnostics.append(f"{t}: individual download returned empty")
+        except Exception as e:
+            diagnostics.append(f"{t}: individual download failed — {str(e)[:80]}")
+
+    if not price_series:
+        return {
+            "error": "Could not download price data for any ticker. "
+                     "This may be a network issue or the tickers may not be available on Yahoo Finance.",
+            "diagnostics": diagnostics,
+        }
+
+    # ── Step 2: Align into a DataFrame ──
+    # Use forward-fill + back-fill to handle minor date gaps rather than dropping all rows
+    prices = pd.DataFrame(price_series)
+    prices = prices.sort_index().ffill().bfill().dropna()
+
+    available = list(prices.columns)
+    skipped = [t for t in tickers if t not in available]
+
+    if len(prices) < 20:
+        return {
+            "error": f"Only {len(prices)} overlapping trading days across tickers (need at least 20). "
+                     f"Tickers with data: {available}. Try a more recent start date.",
+            "diagnostics": diagnostics,
+        }
+
+    if len(available) == 0:
+        return {
+            "error": "No tickers had enough price history after alignment.",
+            "diagnostics": diagnostics,
+        }
+
+    # Map back to quantities for available tickers only
+    avail_shares = np.array(
+        [quantities[tickers.index(t)] for t in available], dtype=float
+    )
+
+    current_prices = prices.iloc[-1].values.astype(float)
+    holdings = avail_shares * current_prices
+    total_investment = float(holdings.sum())
+
+    # ── Step 3: Log returns & covariance ──
+    log_returns = np.log(prices / prices.shift(1)).dropna()
+
+    if len(log_returns) < 15:
+        return {
+            "error": f"Only {len(log_returns)} return observations — need at least 15 for a meaningful simulation.",
+            "diagnostics": diagnostics,
+        }
+
+    cov_matrix = log_returns.cov().values
+    corr_matrix = log_returns.corr().values
+    mu = log_returns.mean().values
+    sigma = log_returns.std().values
+    n = len(available)
+
+    # ── Step 4: Cholesky decomposition ──
+    try:
+        L = np.linalg.cholesky(corr_matrix)
+    except np.linalg.LinAlgError:
+        # Near-PD fix: clamp negative eigenvalues
+        eigvals, eigvecs = np.linalg.eigh(corr_matrix)
+        eigvals = np.maximum(eigvals, 1e-8)
+        corr_fixed = eigvecs @ np.diag(eigvals) @ eigvecs.T
+        try:
+            L = np.linalg.cholesky(corr_fixed)
+        except np.linalg.LinAlgError:
+            # Last resort: treat as uncorrelated
+            L = np.eye(n)
+            diagnostics.append("Correlation matrix not positive-definite; treating stocks as uncorrelated.")
+
+    # ── Step 5: Simulate ──
+    rng = np.random.default_rng(42)
+    epsilon = rng.standard_normal((n, num_simulations))
+    Z = L @ epsilon
+
+    sim_prices = current_prices.reshape(-1, 1) * np.exp(
+        mu.reshape(-1, 1) + sigma.reshape(-1, 1) * Z
+    )
+
+    sim_values = avail_shares @ sim_prices
+    sim_pnl = sim_values - total_investment
+
+    # Per-asset simulated P&L (shape: n × num_simulations).
+    # By construction per_asset_pnl.sum(axis=0) == sim_pnl, so any
+    # decomposition we build from it is internally consistent.
+    per_asset_pnl = avail_shares.reshape(-1, 1) * (
+        sim_prices - current_prices.reshape(-1, 1)
+    )
+
+    var_95 = float(-np.percentile(sim_pnl, 5))
+    var_99 = float(-np.percentile(sim_pnl, 1))
+    var_995 = float(-np.percentile(sim_pnl, 0.5))
+
+    tail = sim_pnl[sim_pnl <= -var_995]
+    tvar_995 = float(-np.mean(tail)) if len(tail) > 0 else var_995
+
+    port_daily_vol = float(np.sqrt(holdings @ cov_matrix @ holdings))
+
+    # ── Step 6: Risk attribution ──
+    # Two decompositions, each using a different (rigorous) definition of
+    # "contribution":
+    #
+    #   (a) Component volatility via Euler decomposition on the covariance
+    #       matrix. Sums to port_daily_vol exactly.
+    #         CV_i = w_i * (Σ w)_i / σ_p
+    #
+    #   (b) Component VaR / TVaR via conditional expectation on the
+    #       simulated scenarios. For VaR we average per-asset P&L in a
+    #       narrow band around the VaR quantile; for TVaR we average
+    #       across the full tail beyond VaR_99.5%.
+    #         C_VaR_i = -E[ pnl_i | portfolio P&L ≈ -VaR_α ]
+    #         C_TVaR_i = -E[ pnl_i | portfolio P&L ≤ -VaR_α ]
+    #       By Euler's theorem these sum (approximately) to VaR_α / TVaR_α.
+
+    # (a) Euler decomposition of daily volatility
+    cov_holdings = cov_matrix @ holdings  # shape (n,)
+    if port_daily_vol > 0:
+        component_vol = holdings * cov_holdings / port_daily_vol
+        marginal_vol = cov_holdings / port_daily_vol
+    else:
+        component_vol = np.zeros(n)
+        marginal_vol = np.zeros(n)
+
+    # (b) Conditional-expectation component VaR using a narrow band around
+    #     the quantile. The band collects scenarios within ±0.5% of the VaR
+    #     percentile, falling back to the tail mean if too few samples land
+    #     inside the band (rare with 10k sims but possible for tight tails).
+    def _component_var_band(confidence: float, band_width: float = 0.005) -> np.ndarray:
+        alpha = 1.0 - confidence
+        lower_pct = max(0.0, (alpha - band_width) * 100.0)
+        upper_pct = min(100.0, (alpha + band_width) * 100.0)
+        lo = np.percentile(sim_pnl, lower_pct)
+        hi = np.percentile(sim_pnl, upper_pct)
+        band_mask = (sim_pnl >= lo) & (sim_pnl <= hi)
+        if band_mask.sum() < 5:
+            tail_mask = sim_pnl <= np.percentile(sim_pnl, alpha * 100.0)
+            if tail_mask.sum() == 0:
+                return np.zeros(n)
+            return -per_asset_pnl[:, tail_mask].mean(axis=1)
+        return -per_asset_pnl[:, band_mask].mean(axis=1)
+
+    comp_var_95 = _component_var_band(0.95)
+    comp_var_99 = _component_var_band(0.99)
+    comp_var_995 = _component_var_band(0.995)
+
+    # Component TVaR 99.5% = mean per-asset P&L over the full 99.5% tail
+    tail_mask_995 = sim_pnl <= -var_995
+    if tail_mask_995.sum() > 0:
+        comp_tvar_995 = -per_asset_pnl[:, tail_mask_995].mean(axis=1)
+    else:
+        comp_tvar_995 = comp_var_995.copy()
+
+    # Assemble a per-asset table. Sorted by largest contribution to VaR 99.5%
+    # so the worst offenders surface first.
+    def _safe_pct(numerator: float, denominator: float) -> float:
+        return float(numerator / denominator) if denominator not in (0.0, 0) else 0.0
+
+    risk_contributions: List[Dict[str, object]] = []
+    for i, ticker in enumerate(available):
+        position_value = float(holdings[i])
+        weight = _safe_pct(position_value, total_investment)
+        risk_contributions.append(
+            {
+                "ticker": ticker,
+                "position_value": position_value,
+                "weight": weight,
+                "marginal_vol": float(marginal_vol[i]),
+                "component_vol": float(component_vol[i]),
+                "component_vol_pct": _safe_pct(float(component_vol[i]), port_daily_vol),
+                "component_var_95": float(comp_var_95[i]),
+                "component_var_95_pct": _safe_pct(float(comp_var_95[i]), var_95),
+                "component_var_99": float(comp_var_99[i]),
+                "component_var_99_pct": _safe_pct(float(comp_var_99[i]), var_99),
+                "component_var_995": float(comp_var_995[i]),
+                "component_var_995_pct": _safe_pct(float(comp_var_995[i]), var_995),
+                "component_tvar_995": float(comp_tvar_995[i]),
+                "component_tvar_995_pct": _safe_pct(float(comp_tvar_995[i]), tvar_995),
+            }
+        )
+
+    risk_contributions.sort(key=lambda row: row["component_var_995"], reverse=True)
+
+    return {
+        "sim_pnl": sim_pnl,
+        "sim_values": sim_values,
+        "total_investment": total_investment,
+        "var_95": var_95,
+        "var_99": var_99,
+        "var_995": var_995,
+        "tvar_995": tvar_995,
+        "port_daily_vol": port_daily_vol,
+        "available_tickers": available,
+        "skipped_tickers": skipped,
+        "num_trading_days": len(log_returns),
+        "diagnostics": diagnostics,
+        "risk_contributions": risk_contributions,
+    }
 
 
 def get_market_rates_data() -> Dict[str, object]:
